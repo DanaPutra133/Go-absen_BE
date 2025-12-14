@@ -20,21 +20,23 @@ func parseDate(dateStr string) time.Time {
 // 1. API KHUSUS ADMIN / BOT (CONTROL SESSION)
 // ==========================================
 
-// POST: Stop Absensi (!absen stop)
 func StopSession(c *gin.Context) {
 	var req struct {
 		SessionID string `json:"session_id" binding:"required"`
 	}
+	todayStr := time.Now().Format("2006-01-02")
+    realID := req.SessionID + "-" + todayStr
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	var session models.Session
-	if err := database.DB.First(&session, "id = ?", req.SessionID).Error; err != nil {
-		c.JSON(404, gin.H{"error": "Session tidak ditemukan"})
-		return
-	}
+    if err := database.DB.First(&session, "id = ?", realID).Error; err != nil {
+        c.JSON(404, gin.H{"error": "Sesi hari ini tidak ditemukan/belum dibuat."})
+        return
+    }
 
 	session.IsActive = false
 	database.DB.Save(&session)
@@ -42,7 +44,6 @@ func StopSession(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Absensi berhasil ditutup."})
 }
 
-// POST: Buka Kembali Absensi (!absen open)
 func OpenSession(c *gin.Context) {
 	var req struct {
 		SessionID string `json:"session_id" binding:"required"`
@@ -70,32 +71,22 @@ func OpenSession(c *gin.Context) {
 
 func RecordAttendance(c *gin.Context) {
 	var req models.AttendanceRequest
-
-	// Validasi JSON
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Set waktu default
 	if req.Timestamp.IsZero() {
 		req.Timestamp = time.Now()
 	}
 	todayDateStr := req.Timestamp.Format("2006-01-02")
-	
+	realSessionID := req.SessionID + "-" + todayDateStr
+
 	tx := database.DB.Begin()
-
 	var session models.Session
-	if err := tx.First(&session, "id = ?", req.SessionID).Error; err == nil {
-
-		if !session.IsActive {
-			tx.Rollback()
-			c.JSON(403, gin.H{"message": "Absensi sudah ditutup oleh Admin!"})
-			return
-		}
-	} else {
+	if err := tx.First(&session, "id = ?", realSessionID).Error; err != nil {
 		session = models.Session{
-			ID:        req.SessionID,
+			ID:        realSessionID, // Simpan ID Unik Harian
 			GuildID:   req.GuildID,
 			Reason:    req.Reason,
 			StartTime: req.Timestamp,
@@ -106,17 +97,24 @@ func RecordAttendance(c *gin.Context) {
 			c.JSON(500, gin.H{"error": "Gagal buat sesi: " + err.Error()})
 			return
 		}
+	} else {
+		// Jika sudah ada, cek aktif tidak
+		if !session.IsActive {
+			tx.Rollback()
+			c.JSON(403, gin.H{"message": "Absensi hari ini sudah ditutup Admin!"})
+			return
+		}
 	}
 	var existingAttendee models.Attendee
-	checkAtt := tx.Where("session_id = ? AND user_id = ?", req.SessionID, req.UserID).First(&existingAttendee)
-	
+	checkAtt := tx.Where("session_id = ? AND user_id = ?", realSessionID, req.UserID).First(&existingAttendee)
+
 	if checkAtt.RowsAffected > 0 {
 		tx.Rollback()
-		c.JSON(409, gin.H{"message": "User sudah absen di sesi ini!"})
+		c.JSON(409, gin.H{"message": "User sudah absen hari ini!"})
 		return
 	}
 	newAttendee := models.Attendee{
-		SessionID: req.SessionID,
+		SessionID: realSessionID, 
 		UserID:    req.UserID,
 		Timestamp: req.Timestamp,
 	}
@@ -127,8 +125,7 @@ func RecordAttendance(c *gin.Context) {
 	}
 	var streak models.Streak
 	err := tx.Where("guild_id = ? AND user_id = ?", req.GuildID, req.UserID).First(&streak).Error
-
-	newStreakCount := 1 
+	newStreakCount := 1
 
 	if err == gorm.ErrRecordNotFound {
 		streak = models.Streak{
@@ -142,17 +139,14 @@ func RecordAttendance(c *gin.Context) {
 		lastAttDate := parseDate(streak.LastAttendance)
 		currentDate := parseDate(todayDateStr)
 
-		if currentDate.Day() == 1 {
+		if currentDate.Format("2006-01-02") == streak.LastAttendance {
+			newStreakCount = streak.CurrentStreak
+		} else if currentDate.Day() == 1 {
 			newStreakCount = 1
 		} else {
 			daysDiff := currentDate.Sub(lastAttDate).Hours() / 24
-
 			if daysDiff >= 0.5 && daysDiff < 1.5 {
-				
 				newStreakCount = streak.CurrentStreak + 1
-			} else if daysDiff < 0.5 {
-				
-				newStreakCount = streak.CurrentStreak
 			} else {
 				newStreakCount = 1
 			}
@@ -171,6 +165,8 @@ func RecordAttendance(c *gin.Context) {
 		"guild_id":        req.GuildID,
 		"user_id":         req.UserID,
 		"reason":          req.Reason,
+		"session_id":    req.SessionID, 
+		"session_db_id": realSessionID,
 	})
 }
 
@@ -181,31 +177,189 @@ func RecordAttendance(c *gin.Context) {
 func GetStreaks(c *gin.Context) {
 	guildID := c.Query("guild_id")
 	userID := c.Query("user_id")
+	sessionID := c.Query("session_id") 
 
 	var streaks []models.Streak
-	query := database.DB
+	
+	query := database.DB.Table("streaks")
 
-	if guildID != "" { query = query.Where("guild_id = ?", guildID) }
-	if userID != "" { query = query.Where("user_id = ?", userID) }
+	// 1. Jika ada Filter Session ID (Logic Paling Rumit)
+	if sessionID != "" {
+		if len(sessionID) < 15 { // Asumsi ID pendek = Channel ID
+			todayStr := time.Now().Format("2006-01-02")
+			sessionID = sessionID + "-" + todayStr
+		}
+		// --------------------------------------------------
+		query = query.Joins("JOIN attendees ON attendees.user_id = streaks.user_id").
+			Where("attendees.session_id = ?", sessionID)
+		
+		if guildID == "" {
+			query = query.Where("streaks.guild_id = (SELECT guild_id FROM sessions WHERE id = ?)", sessionID)
+		}
+	}
 
-	query.Find(&streaks)
-	if len(streaks) == 0 {
-		c.JSON(404, gin.H{"message": "Data streak tidak ditemukan"})
+	if guildID != "" {
+		query = query.Where("streaks.guild_id = ?", guildID)
+	}
+	if userID != "" {
+		query = query.Where("streaks.user_id = ?", userID)
+	}
+	if err := query.Find(&streaks).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Gagal mengambil data streak"})
 		return
 	}
+
+	if len(streaks) == 0 {
+		c.JSON(404, gin.H{"message": "Data streak tidak ditemukan untuk kriteria ini"})
+		return
+	}
+
 	c.JSON(http.StatusOK, streaks)
 }
 
-func GetSessionDetail(c *gin.Context) {
+type AttendeeResponse struct {
+	UserID        string    `json:"user_id"`
+	Timestamp     time.Time `json:"timestamp"`
+	CurrentStreak int       `json:"current_streak"` 
+}
+
+func GetSessionDetail2(c *gin.Context) {
+	channelID := c.Param("id")
 	sessionID := c.Param("id")
 	var session models.Session
-	err := database.DB.Preload("Attendees").First(&session, "id = ?", sessionID).Error
-	if err != nil {
+	if err := database.DB.Where("id = ?", sessionID).First(&session).Error; err != nil {
 		c.JSON(404, gin.H{"error": "Session ID tidak ditemukan"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"session_info": session, "total_hadir": len(session.Attendees)})
+	var attendees []AttendeeResponse
+
+	err := database.DB.Table("attendees").
+		Select("attendees.user_id, attendees.timestamp, streaks.current_streak").
+		Joins("LEFT JOIN streaks ON streaks.user_id = attendees.user_id AND streaks.guild_id = ?", session.GuildID).
+		Where("attendees.session_id = ?", sessionID).
+		Scan(&attendees).Error
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Gagal mengambil data peserta"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"session_info": gin.H{
+			"session_id":    channelID,       
+			"session_db_id": session.ID,
+			"guild_id":   session.GuildID,
+			"reason":     session.Reason,
+			"startTime":  session.StartTime,
+			"is_active":  session.IsActive,
+		},
+		"total_hadir": len(attendees),
+		"attendees":   attendees, 
+	})
 }
+
+func GetSessionDetail3(c *gin.Context) {
+	channelID := c.Param("id") 
+	todayStr := time.Now().Format("2006-01-02")
+	targetSessionID := channelID + "-" + todayStr
+
+	var session models.Session
+	if err := database.DB.Where("id = ?", targetSessionID).First(&session).Error; err != nil {
+		c.JSON(404, gin.H{
+			"error": "Belum ada sesi absensi untuk hari ini (" + todayStr + ")",
+			"session_info": gin.H{
+				"session_id": channelID, 
+				"is_active":  false,
+			},
+			"total_hadir": 0,
+			"attendees":   []string{},
+		})
+		return
+	}
+
+	var attendees []AttendeeResponse
+	database.DB.Table("attendees").
+		Select("attendees.user_id, attendees.timestamp, streaks.current_streak").
+		Joins("LEFT JOIN streaks ON streaks.user_id = attendees.user_id AND streaks.guild_id = ?", session.GuildID).
+		Where("attendees.session_id = ?", targetSessionID).
+		Scan(&attendees)
+
+	c.JSON(http.StatusOK, gin.H{
+		"session_info": gin.H{
+			"session_id":    channelID,       
+			"session_db_id": session.ID, 
+			"guild_id":   session.GuildID,
+			"reason":     session.Reason,
+			"startTime":  session.StartTime,
+			"is_active":  session.IsActive,
+		},
+		"total_hadir": len(attendees),
+		"attendees":   attendees,
+	})
+}
+
+
+func GetSessionDetail(c *gin.Context) {
+	inputID := c.Param("id") // Bisa "123" atau "123-2025-12-14"
+	var session models.Session
+	var finalID string // ID yang akhirnya ketemu di DB
+
+	if err := database.DB.Where("id = ?", inputID).First(&session).Error; err == nil {
+		finalID = session.ID
+	} else {
+		todayStr := time.Now().Format("2006-01-02")
+		targetID := inputID + "-" + todayStr
+		
+		if err2 := database.DB.Where("id = ?", targetID).First(&session).Error; err2 == nil {
+			finalID = session.ID
+		} else {
+			c.JSON(404, gin.H{
+				"error": "Sesi tidak ditemukan.",
+				"session_info": gin.H{
+					"session_id": inputID, 
+					"is_active":  false,
+				},
+				"total_hadir": 0,
+				"attendees":   []string{},
+			})
+			return
+		}
+	}
+
+	// --- AMBIL DATA PESERTA + STREAK (JOIN) ---
+	var attendees []AttendeeResponse
+
+	err := database.DB.Table("attendees").
+		Select("attendees.user_id, attendees.timestamp, streaks.current_streak").
+		Joins("LEFT JOIN streaks ON streaks.user_id = attendees.user_id AND streaks.guild_id = ?", session.GuildID).
+		Where("attendees.session_id = ?", finalID). // Pakai ID yang ketemu tadi
+		Scan(&attendees).Error
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Gagal mengambil data peserta"})
+		return
+	}
+
+	realChannelID := session.ID
+	if len(session.ID) > 11 {
+		realChannelID = session.ID[:len(session.ID)-11]
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"session_info": gin.H{
+			"session_id":    realChannelID,   // "123" (Bersih)
+			"session_db_id": session.ID,      // "123-2025-12-14" (Teknis)
+			"guild_id":      session.GuildID,
+			"reason":        session.Reason,
+			"startTime":     session.StartTime,
+			"is_active":     session.IsActive,
+		},
+		"total_hadir": len(attendees),
+		"attendees":   attendees,
+	})
+}
+
+
 
 func GetUserHistory(c *gin.Context) {
 	userID := c.Query("user_id")
@@ -218,8 +372,48 @@ func GetUserHistory(c *gin.Context) {
 	c.JSON(http.StatusOK, history)
 }
 
+
+type SessionListResponse struct {
+	SessionID   string            `json:"session_id"`   
+	SessionDBID string            `json:"session_db_id"` 
+	GuildID     string            `json:"guild_id"`
+	Reason      string            `json:"reason"`
+	StartTime   time.Time         `json:"startTime"`
+	IsActive    bool              `json:"is_active"`
+	Attendees   []models.Attendee `json:"attendees"` 
+}
+
+
 func GetSessions(c *gin.Context) {
 	var sessions []models.Session
-	database.DB.Preload("Attendees").Find(&sessions)
-	c.JSON(http.StatusOK, sessions)
+	if err := database.DB.Preload("Attendees").Find(&sessions).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Gagal mengambil data sesi"})
+		return
+	}
+
+	// 2. Olah Datanya (Mapping)
+	var response []SessionListResponse
+
+	for _, s := range sessions {
+		
+		realID := s.ID
+		if len(s.ID) > 11 {
+			realID = s.ID[:len(s.ID)-11]
+		}
+
+		data := SessionListResponse{
+			SessionID:   realID, 
+			SessionDBID: s.ID,  
+			GuildID:     s.GuildID,
+			Reason:      s.Reason,
+			StartTime:   s.StartTime,
+			IsActive:    s.IsActive,
+			Attendees:   s.Attendees,
+		}
+
+		response = append(response, data)
+	}
+
+	// 3. Kirim JSON yang sudah rapi
+	c.JSON(http.StatusOK, response)
 }

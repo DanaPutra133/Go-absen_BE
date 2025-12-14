@@ -14,7 +14,9 @@ func SetupRoutes(r *gin.Engine) {
 
 	r.GET("/sessions", controllers.GetSessions)
 	r.GET("/streaks", controllers.GetStreaks)
-	r.GET("/sessions/:id", controllers.GetSessionDetail) 
+	r.GET("/sessions/:id", controllers.GetSessionDetail)
+	// r.GET("/sessions/streaks/:id", controllers.GetSessionDetail2)
+	// r.GET("/sessions/streaks/2/:id", controllers.GetSessionDetail3) 
 	r.POST("/session/stop", controllers.StopSession)
 	r.POST("/session/open", controllers.OpenSession)
 	r.GET("/history", controllers.GetUserHistory)
