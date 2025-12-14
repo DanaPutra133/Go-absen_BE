@@ -78,16 +78,23 @@ func OpenSession(c *gin.Context) {
 // ==========================================
 
 func RecordAttendance(c *gin.Context) {
-	var req models.AttendanceRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+    var req models.AttendanceRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+
+	loc, errLoc := time.LoadLocation("Asia/Jakarta")
+    if errLoc != nil {
+        loc = time.FixedZone("WIB", 7*60*60) 
+    }
+
+	nowJakarta := time.Now().In(loc)
 
 	if req.Timestamp.IsZero() {
-		req.Timestamp = time.Now()
-	}
-	todayDateStr := req.Timestamp.Format("2006-01-02")
+        req.Timestamp = nowJakarta
+    }
+	todayDateStr := req.Timestamp.In(loc).Format("2006-01-02")
 	realSessionID := req.SessionID + "-" + todayDateStr
 
 	tx := database.DB.Begin()
