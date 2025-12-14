@@ -16,6 +16,16 @@ func parseDate(dateStr string) time.Time {
 	return t
 }
 
+
+func getJakartaDateStr() string {
+	loc, err := time.LoadLocation("Asia/Jakarta")
+	if err != nil {
+		loc = time.FixedZone("WIB", 7*60*60) 
+	}
+	return time.Now().In(loc).Format("2006-01-02")
+}
+
+
 // ==========================================
 // 1. API KHUSUS ADMIN / BOT (CONTROL SESSION)
 // ==========================================
@@ -26,7 +36,7 @@ func StopSession(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Parameter session_id wajib diisi (contoh: ?session_id=123)"})
         return
     }
-    todayStr := time.Now().Format("2006-01-02")
+    todayStr := getJakartaDateStr() 
     realID := sessionID + "-" + todayStr
     var session models.Session
     if err := database.DB.First(&session, "id = ?", realID).Error; err != nil {
@@ -54,7 +64,7 @@ func OpenSession(c *gin.Context) {
         return
     }
 
-    todayStr := time.Now().Format("2006-01-02")
+    todayStr := getJakartaDateStr()
     realID := sessionID + "-" + todayStr
     var session models.Session
     if err := database.DB.First(&session, "id = ?", realID).Error; err != nil {
@@ -197,10 +207,10 @@ func GetStreaks(c *gin.Context) {
 	
 	query := database.DB.Table("streaks")
 
-	// 1. Jika ada Filter Session ID (Logic Paling Rumit)
+	
 	if sessionID != "" {
 		if len(sessionID) < 15 { 
-			todayStr := time.Now().Format("2006-01-02")
+			todayStr := getJakartaDateStr()
 			sessionID = sessionID + "-" + todayStr
 		}
 		// --------------------------------------------------
@@ -314,14 +324,14 @@ func GetSessionDetail3(c *gin.Context) {
 
 
 func GetSessionDetail(c *gin.Context) {
-	inputID := c.Param("id") // Bisa "123" atau "123-2025-12-14"
+	inputID := c.Param("id") 
 	var session models.Session
-	var finalID string // ID yang akhirnya ketemu di DB
+	var finalID string 
 
 	if err := database.DB.Where("id = ?", inputID).First(&session).Error; err == nil {
 		finalID = session.ID
 	} else {
-		todayStr := time.Now().Format("2006-01-02")
+		todayStr := getJakartaDateStr()
 		targetID := inputID + "-" + todayStr
 		
 		if err2 := database.DB.Where("id = ?", targetID).First(&session).Error; err2 == nil {
