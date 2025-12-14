@@ -21,50 +21,58 @@ func parseDate(dateStr string) time.Time {
 // ==========================================
 
 func StopSession(c *gin.Context) {
-	var req struct {
-		SessionID string `json:"session_id" binding:"required"`
-	}
-	todayStr := time.Now().Format("2006-01-02")
-    realID := req.SessionID + "-" + todayStr
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	var session models.Session
-    if err := database.DB.First(&session, "id = ?", realID).Error; err != nil {
-        c.JSON(404, gin.H{"error": "Sesi hari ini tidak ditemukan/belum dibuat."})
+    sessionID := c.Query("session_id")
+    if sessionID == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Parameter session_id wajib diisi (contoh: ?session_id=123)"})
         return
     }
+    todayStr := time.Now().Format("2006-01-02")
+    realID := sessionID + "-" + todayStr
+    var session models.Session
+    if err := database.DB.First(&session, "id = ?", realID).Error; err != nil {
+        c.JSON(404, gin.H{"error": "Sesi hari ini belum dibuat/belum ada yang absen."})
+        return
+    }
+    if !session.IsActive {
+        c.JSON(400, gin.H{"message": "Sesi absensi SUDAH DITUTUP sebelumnya. Tidak ada perubahan."})
+        return
+    }
+    session.IsActive = false
+    database.DB.Save(&session)
 
-	session.IsActive = false
-	database.DB.Save(&session)
-
-	c.JSON(http.StatusOK, gin.H{"message": "Absensi berhasil ditutup."})
+    c.JSON(http.StatusOK, gin.H{
+        "message": "Absensi BERHASIL DITUTUP (Paused). User tidak bisa absen sementara.",
+        "session_db_id": realID,
+    })
 }
 
 func OpenSession(c *gin.Context) {
-	var req struct {
-		SessionID string `json:"session_id" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+    sessionID := c.Query("session_id")
 
-	var session models.Session
-	if err := database.DB.First(&session, "id = ?", req.SessionID).Error; err != nil {
-		c.JSON(404, gin.H{"error": "Session tidak ditemukan"})
-		return
-	}
+    if sessionID == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Parameter session_id wajib diisi"})
+        return
+    }
 
-	session.IsActive = true
-	database.DB.Save(&session)
+    todayStr := time.Now().Format("2006-01-02")
+    realID := sessionID + "-" + todayStr
+    var session models.Session
+    if err := database.DB.First(&session, "id = ?", realID).Error; err != nil {
+        c.JSON(404, gin.H{"error": "Tidak ada sesi hari ini untuk dibuka kembali."})
+        return
+    }
+    if session.IsActive {
+        c.JSON(400, gin.H{"message": "Sesi absensi SEDANG BERJALAN (Sudah Terbuka)."})
+        return
+    }
+    session.IsActive = true
+    database.DB.Save(&session)
 
-	c.JSON(http.StatusOK, gin.H{"message": "Absensi berhasil dibuka kembali."})
+    c.JSON(http.StatusOK, gin.H{
+        "message": "Absensi DIBUKA KEMBALI (Resumed). Silakan lanjut absen.",
+        "session_db_id": realID,
+    })
 }
-
 // ==========================================
 // 2. API USER (ABSENSI UTAMA)
 // ==========================================
@@ -98,7 +106,6 @@ func RecordAttendance(c *gin.Context) {
 			return
 		}
 	} else {
-		// Jika sudah ada, cek aktif tidak
 		if !session.IsActive {
 			tx.Rollback()
 			c.JSON(403, gin.H{"message": "Absensi hari ini sudah ditutup Admin!"})
@@ -185,7 +192,7 @@ func GetStreaks(c *gin.Context) {
 
 	// 1. Jika ada Filter Session ID (Logic Paling Rumit)
 	if sessionID != "" {
-		if len(sessionID) < 15 { // Asumsi ID pendek = Channel ID
+		if len(sessionID) < 15 { 
 			todayStr := time.Now().Format("2006-01-02")
 			sessionID = sessionID + "-" + todayStr
 		}
@@ -347,8 +354,8 @@ func GetSessionDetail(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"session_info": gin.H{
-			"session_id":    realChannelID,   // "123" (Bersih)
-			"session_db_id": session.ID,      // "123-2025-12-14" (Teknis)
+			"session_id":    realChannelID, 
+			"session_db_id": session.ID,     
 			"guild_id":      session.GuildID,
 			"reason":        session.Reason,
 			"startTime":     session.StartTime,
@@ -391,7 +398,6 @@ func GetSessions(c *gin.Context) {
 		return
 	}
 
-	// 2. Olah Datanya (Mapping)
 	var response []SessionListResponse
 
 	for _, s := range sessions {
@@ -413,7 +419,5 @@ func GetSessions(c *gin.Context) {
 
 		response = append(response, data)
 	}
-
-	// 3. Kirim JSON yang sudah rapi
 	c.JSON(http.StatusOK, response)
 }
